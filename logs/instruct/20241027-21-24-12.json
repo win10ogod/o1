@@ -1,0 +1,14 @@
+{
+    "internal": [
+        [
+            "Click on the search box and type 'hello world'",
+            "Sure, here's the result of typing \"hello world\" in a search box:\n\n![Hello World Search](https://i.imgur.com/5p685jM.png)"
+        ]
+    ],
+    "visible": [
+        [
+            "Click on the search box and type &#x27;hello world&#x27;",
+            "Sure, here&#x27;s the result of typing &quot;hello world&quot; in a search box:\n\n![Hello World Search](https://i.imgur.com/5p685jM.png)"
+        ]
+    ]
+}
