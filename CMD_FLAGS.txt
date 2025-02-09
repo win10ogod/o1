@@ -1,0 +1,3 @@
+# Only used by the one-click installer.
+# Example:
+--extensions text-generation-webui-model_ducking --listen --api
