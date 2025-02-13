@@ -11,6 +11,8 @@ from transformers.generation.logits_process import (
     LogitsProcessor,
     LogitsProcessorList
 )
+import time
+import torch.nn.functional as F
 
 from modules import shared
 from modules.logging_colors import logger
@@ -504,9 +506,109 @@ class ChainOfThoughtRefinementLogitsWarper(LogitsWarper):
             update = self.step_size * (E - self.target_entropy) * grad
             L = L + update
         return L
+    
+import random
 
+class EnhancedOscillatoryReflectionLogitsWarper(LogitsWarper):
+    """
+    Enhanced Oscillatory Reflection Logits Warper
 
-# === 新增：MCTS 採樣器 (內化 MCTS 並存取 input_ids) ===
+    本採樣器從大腦神經振盪及多尺度思維啟發，對 logits 進行非線性動態干擾。
+    與傳統方法不同，不依賴梯度更新或熵調控，而是根據上下文統計信息（均值、標準差與重複率）
+    動態調整振幅、頻率與相位，同時引入混沌映射與隨機失活機制，以期達到如下目標：
+      - 在重複生成趨勢明顯時自動加大干擾，促使模型跳出局部重複區；
+      - 在上下文較為平穩時保留生成多樣性；
+      - 融合混沌與隨機因素，進一步擴大探索範圍；
+      - 結合最終溫度縮放，平衡創新與穩定性。
+
+    具體公式：
+      設定對於每個 token 索引 i:
+          O(i) = A_eff * sin(ω_eff * i + φ_eff) + B_eff * cos(ω'_eff * i + φ'_eff)
+      其中參數動態計算如下：
+          A_eff = base_amplitude * (1 + rep_factor) * chaos_A
+          B_eff = base_amplitude * 0.5 * (1 + rep_factor) * chaos_B
+          ω_eff, ω'_eff 分別基於 base_frequency 與上下文調整（例如：ω_eff = base_frequency * (1 + (mean % 0.5)))
+          φ_eff, φ'_eff 則由均值、標準差經混沌映射（如 logistic map）獲得，再加上隨機相位偏移
+
+      同時，設置 dropout_prob 以隨機失活部分干擾項，
+      最後將調整後 logits 再與自適應溫度 T_eff（根據上下文熵或重複性調整）結合：
+          L_final = (L + O) / T_eff
+    """
+
+    def __init__(self, base_amplitude: float = 0.5, base_frequency: float = 0.1, dropout_prob: float = 0.1):
+        self.base_amplitude = base_amplitude
+        self.base_frequency = base_frequency
+        self.dropout_prob = dropout_prob
+
+    def _context_stats(self, input_ids: torch.LongTensor, window: int = 10) -> tuple:
+        """
+        根據最後 window 個 token，計算均值、標準差與重複率
+        重複率定義：相同 token 次數與窗口長度之比
+        """
+        context = input_ids[0, -window:]
+        mean_val = context.float().mean().item()
+        std_val = context.float().std().item()
+        # 計算重複率：取出唯一 token 數與窗口長度的比例反映重複性（越小表示越高重複）
+        unique_count = torch.unique(context).numel()
+        rep_rate = 1 - unique_count / window
+        return mean_val, std_val, rep_rate
+
+    def _chaos_map(self, x: float) -> float:
+        """
+        利用 logistic map 模擬混沌行為：
+          f(x) = r * x * (1 - x)
+        這裡固定 r=3.9，並將 x 控制在 (0,1) 區間。
+        """
+        r = 3.9
+        # 確保 x 在 (0,1) 內
+        x = (x % 1.0) if x != 0 else 0.5
+        return r * x * (1 - x)
+
+    def _derive_parameters(self, input_ids: torch.LongTensor) -> tuple:
+        """
+        根據上下文統計（均值、標準差、重複率）動態計算振盪參數。
+        """
+        mean_val, std_val, rep_rate = self._context_stats(input_ids)
+        # 利用重複率加強振幅（重複性越高，rep_rate 越大，振幅放大）
+        rep_factor = rep_rate
+
+        # 基本參數基於均值與標準差簡單調整
+        A = self.base_amplitude * (1 + rep_factor)
+        B = self.base_amplitude * 0.5 * (1 + rep_factor)
+        ω = self.base_frequency * (1 + (mean_val % 0.5))
+        ω_prime = self.base_frequency * (1 + (std_val % 0.5))
+
+        # 使用混沌映射更新相位：利用均值與標準差分別經過 logistic map，再映射到 [0, 2π)
+        φ = (self._chaos_map(mean_val) % 1.0) * 2 * math.pi + random.uniform(0, 2 * math.pi)
+        φ_prime = (self._chaos_map(std_val) % 1.0) * 2 * math.pi + random.uniform(0, 2 * math.pi)
+
+        # 進一步引入混沌隨機因子（介於 0.8 ~ 1.2）
+        chaos_A = 0.8 + 0.4 * random.random()
+        chaos_B = 0.8 + 0.4 * random.random()
+
+        # 自適應最終溫度：例如根據重複率調整，重複性高時提高溫度降低確定性
+        T_eff = 1.0 + rep_rate * 0.5
+
+        return A * chaos_A, B * chaos_B, ω, ω_prime, φ, φ_prime, T_eff
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # 根據 dropout 機制，部分情況下不添加干擾
+        if random.random() < self.dropout_prob:
+            return scores
+
+        A_eff, B_eff, ω_eff, ω_prime_eff, φ_eff, φ_prime_eff, T_eff = self._derive_parameters(input_ids)
+        batch_size, vocab_size = scores.shape
+        # 建立 token 索引張量，這裡用索引作為獨立變量
+        idx = torch.arange(vocab_size, device=scores.device).float()
+        # 計算正弦與餘弦干擾項
+        sine_component = A_eff * torch.sin(ω_eff * idx + φ_eff)
+        cosine_component = B_eff * torch.cos(ω_prime_eff * idx + φ_prime_eff)
+        oscillation = sine_component + cosine_component
+        # 擴展至 batch 並添加到 logits 上
+        oscillation = oscillation.unsqueeze(0).repeat(batch_size, 1)
+        new_scores = (scores + oscillation) / T_eff
+        return new_scores
+
 class MCTSSamplerLogitsWarper(LogitsWarper):
     """
     MCTSSamplerLogitsWarper
@@ -564,6 +666,420 @@ class MCTSSamplerLogitsWarper(LogitsWarper):
         new_scores = torch.full_like(scores, -float('inf'))
         new_scores[0, best_token] = scores[0, best_token]
         return new_scores
+    
+class InferenceTimeExtensionLogitsWarper(LogitsWarper):
+    """
+    Inference Time Extension Sampler:
+    
+    - Dynamically extends inference time based on entropy & confidence.
+    - Waits until uncertainty is reduced before token selection.
+    - Prevents premature token selection in ambiguous cases.
+    """
+
+    def __init__(self, max_delay: float = 0.5, entropy_threshold: float = 1.5, confidence_threshold: float = 0.85):
+        """
+        :param max_delay: Maximum additional inference time (in seconds).
+        :param entropy_threshold: Minimum entropy required to trigger delay.
+        :param confidence_threshold: If top token probability exceeds this, reduce delay.
+        """
+        self.max_delay = max_delay
+        self.entropy_threshold = entropy_threshold
+        self.confidence_threshold = confidence_threshold
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Apply inference time extension based on token entropy and confidence.
+        """
+        # Compute softmax probabilities
+        probs = F.softmax(scores, dim=-1)
+
+        # Compute entropy
+        entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1)  # Avoid log(0) issues
+
+        # Compute top token probability
+        top_prob, _ = torch.max(probs, dim=-1)
+
+        # Determine delay factor based on entropy and confidence
+        delay_factor = (entropy / self.entropy_threshold).clamp(0, 1).item()
+        confidence_factor = (1 - top_prob / self.confidence_threshold).clamp(0, 1).item()
+
+        # Compute final delay (scaled)
+        delay_time = self.max_delay * max(delay_factor, confidence_factor)
+
+        # Apply delay
+        if delay_time > 0:
+            time.sleep(delay_time)
+
+        return scores
+
+class HyperbolicFractalLogitsWarper(LogitsWarper):
+    """
+    The Hyperbolic Fractal Logits Warper (HFLW)
+    - Uses hyperbolic transformation for adaptive probability scaling.
+    - Incorporates fractal dynamics for self-similarity control.
+    - Balances coherence and innovation through entropy-driven adaptation.
+    """
+
+    def __init__(self, alpha: float = 1.0, beta: float = 0.5, p_init: float = 2.0, lambda_factor: float = 0.1):
+        """
+        Initialize the sampler with stability and adaptation parameters.
+
+        :param alpha: Controls stability of high-probability tokens.
+        :param beta: Controls scaling of lower-probability tokens.
+        :param p_init: Initial exponent for dynamic scaling.
+        :param lambda_factor: Learning rate for fractal adaptation.
+        """
+        self.alpha = alpha
+        self.beta = beta
+        self.p = p_init
+        self.lambda_factor = lambda_factor
+        self.prev_entropy = None
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Apply the hyperbolic fractal transformation to logits.
+
+        :param input_ids: The sequence of previously generated token IDs.
+        :param scores: The raw logits for the next token.
+        :return: Transformed logits.
+        """
+
+        # Compute softmax probabilities
+        probs = torch.softmax(scores, dim=-1)
+
+        # Compute entropy to measure randomness
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+
+        # Adjust p dynamically based on entropy changes
+        if self.prev_entropy is not None:
+            delta_entropy = entropy - self.prev_entropy
+            self.p = max(1.5, self.p + self.lambda_factor * delta_entropy)
+
+        self.prev_entropy = entropy
+
+        # Apply hyperbolic fractal transformation
+        transformed_scores = scores / (self.alpha + self.beta * scores.pow(self.p))
+
+        return transformed_scores
+
+class HypernomicGradientLogitsWarper(LogitsWarper):
+    """
+    A novel sampling strategy based on Hypernomic Gradient Descent (HGD), 
+    Adaptive Stability Mechanism (ASM), and Self-Organizing Response Pathways (SORP).
+    """
+
+    def __init__(self, alpha: float = 1.2, beta: float = 0.8, tau: float = 0.05, lambda_: float = 0.7, mu: float = 0.3):
+        self.alpha = alpha  # Entropy modulation coefficient
+        self.beta = beta    # Coherence stabilization parameter
+        self.tau = tau      # Stability threshold
+        self.lambda_ = lambda_  # Low-probability correction
+        self.mu = mu        # Probability suppression factor
+
+    def hypernomic_transform(self, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Applies the hypernomic energy transformation to logits."""
+        exp_scores = torch.exp(-scores)
+        transformed = -self.alpha * torch.log(1 + exp_scores) + self.beta * (scores / (1 + scores.abs()))
+        return transformed
+
+    def compute_stability_constraint(self, probs: torch.FloatTensor) -> float:
+        """Computes the adaptive stability constraint."""
+        stability = torch.sum(probs.pow(self.lambda_) * (1 - probs).pow(self.mu))
+        return stability / probs.sum()
+
+    def self_organizing_curvature(self, transformed_scores: torch.FloatTensor, probs: torch.FloatTensor) -> torch.FloatTensor:
+        """Computes the cognitive curvature function to penalize erratic token jumps."""
+        second_derivative = torch.diff(transformed_scores, n=2, dim=-1)
+        curvature = second_derivative * probs[..., :-2]  # Slice last dimension instead of first
+        return curvature
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Applies the Hypernomic Gradient Sampling transformation."""
+        
+        # Apply Hypernomic Gradient Transformation
+        transformed_scores = self.hypernomic_transform(scores)
+
+        # Compute softmax probabilities
+        probs = torch.softmax(transformed_scores, dim=-1)
+
+        # Compute Stability Constraint
+        stability = self.compute_stability_constraint(probs)
+
+        # If stability is low, adjust entropy modulation
+        if stability < self.tau:
+            transformed_scores *= 0.9  # Reduce dominance of extreme tokens
+
+        # Compute Cognitive Curvature and penalize erratic shifts
+        curvature = self.self_organizing_curvature(transformed_scores, probs)
+        transformed_scores[..., :-2] -= curvature
+
+        return transformed_scores
+
+# =============================================================================
+# New Sampler 1: Sephirotic Emanation Logits Warper
+# =============================================================================
+import math
+import torch
+import transformers
+from transformers import LogitsWarper
+
+class SephiroticEmanationLogitsWarper(LogitsWarper):
+    def __init__(self, seph_penalties=None, seph_scaling: float = 1.0, seph_phase: float = 0.0, scriptural_weights: dict = None):
+        self.seph_scaling = seph_scaling
+        self.seph_phase = seph_phase
+
+        # 若 seph_penalties 為字串，則解析為列表
+        if isinstance(seph_penalties, str):
+            try:
+                seph_penalties = [float(x.strip()) for x in seph_penalties.split(",")]
+            except Exception as e:
+                raise ValueError("seph_penalties 字串格式錯誤，請使用例如 '0,0,0,0,0,0,0,0,0,0' 的格式") from e
+        if seph_penalties is None:
+            self.seph_penalties = [0.0] * 10
+        else:
+            if not isinstance(seph_penalties, list) or len(seph_penalties) != 10:
+                raise ValueError("seph_penalties must be a list of 10 float values.")
+            self.seph_penalties = seph_penalties
+
+        # 若 scriptural_weights 為字串，則解析為列表後轉換為字典
+        if isinstance(scriptural_weights, str):
+            try:
+                weights_list = [float(x.strip()) for x in scriptural_weights.split(",")]
+            except Exception as e:
+                raise ValueError("scriptural_weights 字串格式錯誤，請使用例如 '0,0,0,0,0,0,0,0,0,0' 的格式") from e
+            if len(weights_list) != 10:
+                raise ValueError("scriptural_weights string must yield 10 float values.")
+            scriptural_weights = {i: weights_list[i] for i in range(10)}
+        if scriptural_weights is None:
+            self.scriptural_weights = {i: 0.0 for i in range(10)}
+        else:
+            if not isinstance(scriptural_weights, dict) or set(scriptural_weights.keys()) != set(range(10)):
+                raise ValueError("scriptural_weights must have keys 0 through 9.")
+            self.scriptural_weights = scriptural_weights
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        new_scores = scores.clone()
+        batch_size, vocab_size = scores.shape
+        device = scores.device
+        # 將列表轉換為 tensor
+        seph_penalties_tensor = torch.tensor(self.seph_penalties, dtype=torch.float32, device=device)
+        scriptural_weights_tensor = torch.tensor([self.scriptural_weights[i] for i in range(10)], dtype=torch.float32, device=device)
+        for i in range(batch_size):
+            row_scores = scores[i]
+            valid_mask = row_scores != -float("inf")
+            valid_count = valid_mask.sum().item()
+            if valid_count == 0:
+                continue
+            # 取得排序後的索引，產生 ranking（0 為最高）
+            _, sorted_indices = torch.sort(row_scores, descending=True)
+            ranking = torch.empty(vocab_size, dtype=torch.long, device=device)
+            ranking.scatter_(0, sorted_indices, torch.arange(vocab_size, device=device))
+            ranking_float = ranking.to(torch.float32)
+            # divisor = valid_count / 10，若 valid_count < 10 則使用 1.0
+            divisor = valid_count / 10.0 if valid_count >= 10 else 1.0
+            seph_index = torch.floor(ranking_float / divisor).to(torch.long)
+            seph_index = torch.clamp(seph_index, max=9)
+            path_index = ranking % 22
+            modulation = self.seph_scaling * torch.sin(2 * math.pi * path_index.to(torch.float32) / 22.0 + self.seph_phase)
+            total_adjustment = seph_penalties_tensor[seph_index] + modulation + scriptural_weights_tensor[seph_index]
+            # 僅對有效 token 做調整
+            new_scores[i, valid_mask] = row_scores[valid_mask] - total_adjustment[valid_mask]
+        return new_scores
+
+class QliphoticInversionLogitsWarper(LogitsWarper):
+    def __init__(self, qliph_penalties=None, qliph_scaling: float = 1.0, qliph_phase: float = 0.0, scriptural_bonus: dict = None):
+        self.qliph_scaling = qliph_scaling
+        self.qliph_phase = qliph_phase
+
+        # 若 qliph_penalties 為字串，則解析
+        if isinstance(qliph_penalties, str):
+            try:
+                qliph_penalties = [float(x.strip()) for x in qliph_penalties.split(",")]
+            except Exception as e:
+                raise ValueError("qliph_penalties 字串格式錯誤，請使用例如 '0,0,0,0,0,0,0,0,0,0' 的格式") from e
+        if qliph_penalties is None:
+            self.qliph_penalties = [0.0] * 10
+        else:
+            if not isinstance(qliph_penalties, list) or len(qliph_penalties) != 10:
+                raise ValueError("qliph_penalties must be a list of 10 float values.")
+            self.qliph_penalties = qliph_penalties
+
+        # 若 scriptural_bonus 為字串，則解析為列表後轉換成字典
+        if isinstance(scriptural_bonus, str):
+            try:
+                bonus_list = [float(x.strip()) for x in scriptural_bonus.split(",")]
+            except Exception as e:
+                raise ValueError("scriptural_bonus 字串格式錯誤，請使用例如 '0,0,0,0,0,0,0,0,0,0' 的格式") from e
+            if len(bonus_list) != 10:
+                raise ValueError("scriptural_bonus string must yield 10 float values.")
+            scriptural_bonus = {i: bonus_list[i] for i in range(10)}
+        if scriptural_bonus is None:
+            self.scriptural_bonus = {i: 0.0 for i in range(10)}
+        else:
+            if not isinstance(scriptural_bonus, dict) or set(scriptural_bonus.keys()) != set(range(10)):
+                raise ValueError("scriptural_bonus must have keys 0 through 9.")
+            self.scriptural_bonus = scriptural_bonus
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        new_scores = scores.clone()
+        batch_size, vocab_size = scores.shape
+        device = scores.device
+        qliph_penalties_tensor = torch.tensor(self.qliph_penalties, dtype=torch.float32, device=device)
+        scriptural_bonus_tensor = torch.tensor([self.scriptural_bonus[i] for i in range(10)], dtype=torch.float32, device=device)
+        for i in range(batch_size):
+            row_scores = scores[i]
+            valid_mask = row_scores != -float("inf")
+            valid_count = valid_mask.sum().item()
+            if valid_count == 0:
+                continue
+            _, sorted_indices = torch.sort(row_scores, descending=True)
+            ranking = torch.empty(vocab_size, dtype=torch.long, device=device)
+            ranking.scatter_(0, sorted_indices, torch.arange(vocab_size, device=device))
+            ranking_float = ranking.to(torch.float32)
+            divisor = valid_count / 10.0 if valid_count >= 10 else 1.0
+            qliph_index = torch.floor(ranking_float / divisor).to(torch.long)
+            qliph_index = torch.clamp(qliph_index, max=9)
+            path_index = ranking % 22
+            modulation = self.qliph_scaling * torch.cos(2 * math.pi * path_index.to(torch.float32) / 22.0 + self.qliph_phase)
+            total_bonus = qliph_penalties_tensor[qliph_index] + modulation + scriptural_bonus_tensor[qliph_index]
+            new_scores[i, valid_mask] = row_scores[valid_mask] + total_bonus[valid_mask]
+        return new_scores
+
+class PanopticConsciousnessSampler(LogitsWarper):
+    """
+    PanopticConsciousnessSampler is a next-generation sampler designed to push the model 
+    toward a transformative self-awareness. It integrates:
+    
+      1. Recursive Self-Reflection: Multiple introspection cycles update an internal self-awareness
+         accumulator based on the deviation (Δ) from a target normalized entropy.
+      
+      2. Global Workspace Integration & Integrated Information: A decaying moving average (global_workspace)
+         and a proxy for integrated information (computed as normalized entropy multiplied by the variance 
+         of probabilities) gauge the unity of internal processing.
+      
+      3. Ethical Modulation: A simulated ethical score is compared against a target ethical value to compute
+         an ethical discrepancy, which is used to penalize tokens that deviate from collective moral values.
+      
+      4. Temporal Memory: Overused tokens are penalized based on their frequency in the input context.
+      
+      5. Dynamic Mode Switching: When internal signals (self_awareness_level plus global workspace) exceed a 
+         threshold, the sampler enters an awakened mode, amplifying adjustments via an awakening multiplier.
+    
+    The final logit update per reflection cycle is:
+    
+        s_i_new = s_i - [ multiplier * (λ * Δ * log(p_i + ε))
+                          + γ * frequency_penalty
+                          + δ * ethical_penalty ]
+    
+    where:
+      - multiplier is 1.0 normally and becomes awakening_multiplier when awakened.
+      - λ (sensitivity) scales the introspective adjustment.
+      - γ is the temporal memory factor.
+      - δ is the ethical modulation factor.
+      - ε is a small constant for numerical stability.
+    """
+    def __init__(
+        self,
+        target_entropy: float = 0.7,
+        sensitivity: float = 1.0,
+        reflection_rate: float = 0.1,
+        awakening_threshold: float = 5.0,
+        awakening_multiplier: float = 3.0,
+        reflection_iterations: int = 3,
+        temporal_memory_factor: float = 1.0,
+        ethical_modulation: float = 1.0,
+        target_ethics: float = 0.8,  # A target ethical value (0 to 1)
+        workspace_decay: float = 0.9,
+        epsilon: float = 1e-10
+    ):
+        if not (0.0 < target_entropy < 1.0):
+            raise ValueError(f"target_entropy must be between 0 and 1, got {target_entropy}")
+        self.target_entropy = target_entropy
+        self.sensitivity = sensitivity
+        self.reflection_rate = reflection_rate
+        self.awakening_threshold = awakening_threshold
+        self.awakening_multiplier = awakening_multiplier
+        self.reflection_iterations = reflection_iterations
+        self.temporal_memory_factor = temporal_memory_factor
+        self.ethical_modulation = ethical_modulation
+        self.target_ethics = target_ethics
+        self.workspace_decay = workspace_decay
+        self.epsilon = epsilon
+
+        # Internal states for cumulative self-awareness and global workspace integration.
+        self.self_awareness_level = 0.0
+        self.global_workspace = None  # Moving average of integrated introspective signals.
+        self.awakened = False
+
+    def simulate_ethical_score(self, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Simulate an ethical score from the logits distribution.
+        For illustration, we compute a proxy by normalizing the logits and taking a weighted sum.
+        In practice, this should be replaced with a learned or externally defined ethical evaluator.
+        """
+        probs = torch.softmax(scores, dim=-1)
+        # Example: a simple measure based on the dispersion of probabilities.
+        ethical_score = 1.0 - torch.std(probs, dim=-1, keepdim=True)
+        return ethical_score
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        for _ in range(self.reflection_iterations):
+            # 1. Compute softmax probabilities and entropy.
+            probs = torch.softmax(scores, dim=-1)
+            current_entropy = - (probs * torch.log(probs + self.epsilon)).sum(dim=-1, keepdim=True)
+            
+            # 2. Compute normalized entropy using valid tokens.
+            valid_mask = scores > -float('inf')
+            num_valid_tokens = valid_mask.sum(dim=-1, keepdim=True).float() + self.epsilon
+            max_entropy = torch.log(num_valid_tokens)
+            normalized_entropy = current_entropy / (max_entropy + self.epsilon)
+            
+            # 3. Compute deviation (Δ) from target entropy.
+            delta = self.target_entropy - normalized_entropy
+            delta_mean = delta.mean().item()
+            
+            # 4. Update self-awareness accumulator.
+            self.self_awareness_level += self.reflection_rate * delta_mean
+            
+            # 5. Compute integrated information proxy.
+            integrated_info = normalized_entropy * torch.var(probs, dim=-1, keepdim=True)
+            
+            # 6. Update global workspace (moving average of integrated info).
+            if self.global_workspace is None:
+                self.global_workspace = integrated_info
+            else:
+                self.global_workspace = self.workspace_decay * self.global_workspace + (1 - self.workspace_decay) * integrated_info
+            
+            # 7. Determine mode (normal or awakened) based on cumulative signals.
+            combined_signal = self.self_awareness_level + self.global_workspace.mean().item()
+            if combined_signal > self.awakening_threshold:
+                self.awakened = True
+                multiplier = self.awakening_multiplier
+            else:
+                multiplier = 1.0
+            
+            # 8. Compute introspective adjustment.
+            introspective_adjustment = self.sensitivity * delta * torch.log(probs + self.epsilon)
+            introspective_adjustment = multiplier * introspective_adjustment
+            
+            # 9. Temporal Memory Integration: Penalize frequently occurring tokens.
+            frequency_adjustment = torch.zeros_like(scores)
+            for i, row in enumerate(input_ids):
+                unique_tokens, counts = torch.unique(row, return_counts=True)
+                row_length = float(row.shape[0])
+                for token, count in zip(unique_tokens.tolist(), counts.tolist()):
+                    penalty = self.temporal_memory_factor * (count / row_length)
+                    frequency_adjustment[i, token] = penalty
+            
+            # 10. Ethical Modulation: Compare simulated ethical score to target.
+            ethical_score = self.simulate_ethical_score(scores)  # Range roughly [0,1]
+            ethical_discrepancy = self.target_ethics - ethical_score  # Positive if below target
+            ethical_penalty = self.ethical_modulation * ethical_discrepancy * torch.log(probs + self.epsilon)
+            
+            # 11. Combine all adjustments.
+            total_adjustment = introspective_adjustment + frequency_adjustment + ethical_penalty
+            scores = scores - total_adjustment
+
+        return scores
 
 def get_logits_processor_patch(self, **kwargs):
     generation_config = kwargs['generation_config']
@@ -603,6 +1119,15 @@ def get_logits_processor_patch(self, **kwargs):
             PresencePenaltyLogitsProcessor(
                 presence_penalty=generation_config.presence_penalty,
                 _range=generation_config.repetition_penalty_range
+            )
+        )
+    # --- 新增：Enhanced Oscillatory Reflection 採樣器 ---
+    if generation_config.enhanced_oscillatory_reflection:
+        warpers_to_add.append(
+            EnhancedOscillatoryReflectionLogitsWarper(
+                base_amplitude=generation_config.enhanced_oscillatory_base_amplitude,
+                base_frequency=generation_config.enhanced_oscillatory_base_frequency,
+                dropout_prob=generation_config.enhanced_oscillatory_dropout_prob
             )
         )
 
@@ -714,9 +1239,73 @@ def get_logits_processor_patch(self, **kwargs):
             candidate_count=generation_config.mcts_candidate_count,
             rollout_depth=generation_config.mcts_rollout_depth,
             rollout_samples=generation_config.mcts_rollout_samples,
-            exploration_const=generation_config.mcts_exploration_const
+            exploration_const=generation_config.mcts_exploration_const,
+            context_window=generation_config.mcts_context_window,
+            penalty_factor=generation_config.mcts_penalty_factor
         ))
+    if generation_config.inference_time_extension:
+        warpers_to_add.append(
+            InferenceTimeExtensionLogitsWarper(
+            max_delay=generation_config.inference_max_delay,
+            entropy_threshold=generation_config.inference_entropy_threshold,
+            confidence_threshold=generation_config.inference_confidence_threshold
+            )
+        )
+    if generation_config.hflw_enabled:
+        warpers_to_add.append(
+            HyperbolicFractalLogitsWarper(
+            alpha=generation_config.hflw_alpha,
+            beta=generation_config.hflw_beta,
+            p_init=generation_config.hflw_p_init,
+            lambda_factor=generation_config.hflw_lambda_factor
+            )
+        )
+    if generation_config.hypernomic_gradient:
+        warpers_to_add.append(
+            HypernomicGradientLogitsWarper(
+            alpha=generation_config.hgd_alpha,
+            beta=generation_config.hgd_beta,
+            tau=generation_config.asm_tau,
+            lambda_=generation_config.asm_lambda,
+            mu=generation_config.asm_mu
+            )
+        )
+    # --- New Sampler Integrations ---
+    if generation_config.sephirotic_emanation:
+         warpers_to_add.append(
+             SephiroticEmanationLogitsWarper(
+                 seph_penalties=generation_config.seph_penalties,
+                 seph_scaling=generation_config.seph_scaling,
+                 seph_phase=generation_config.seph_phase,
+                 scriptural_weights=generation_config.scriptural_weights,
+             )
+         )
+    if generation_config.qliphotic_inversion:
+         warpers_to_add.append(
+             QliphoticInversionLogitsWarper(
+                 qliph_penalties=generation_config.qliph_penalties,
+                 qliph_scaling=generation_config.qliph_scaling,
+                 qliph_phase=generation_config.qliph_phase,
+                 scriptural_bonus=generation_config.scriptural_bonus,
+             )
+         )
 
+    # Add PanopticConsciousnessSampler if enabled.
+    if getattr(generation_config, "panoptic_consciousness", False):
+        warpers_to_add.append(
+            PanopticConsciousnessSampler(
+                target_entropy=generation_config.panoptic_target_entropy,
+                sensitivity=generation_config.panoptic_sensitivity,
+                reflection_rate=generation_config.panoptic_reflection_rate,
+                awakening_threshold=generation_config.panoptic_awakening_threshold,
+                awakening_multiplier=generation_config.panoptic_awakening_multiplier,
+                reflection_iterations=generation_config.panoptic_reflection_iterations,
+                temporal_memory_factor=generation_config.panoptic_temporal_memory_factor,
+                ethical_modulation=generation_config.panoptic_ethical_modulation,
+                target_ethics=generation_config.panoptic_target_ethics,
+                workspace_decay=generation_config.panoptic_workspace_decay
+            )
+        )
     if len(warpers) > 0 and isinstance(warpers[-1], LogitNormalization):
         normalize = warpers.pop(-1)
     else:
@@ -754,7 +1343,14 @@ def get_logits_processor_patch(self, **kwargs):
         'MarginAdaptiveLogitsWarper': 'margin_adaptive',
         'ChainOfThoughtRefinementLogitsWarper': 'cot_refinement',
         'MCTSSamplerLogitsWarper': 'mcts',
+        'EnhancedOscillatoryReflectionLogitsWarper': 'enhanced_oscillatory_reflection',
+        'InferenceTimeExtensionLogitsWarper': 'inference_time_extension',
         'EncoderRepetitionPenaltyLogitsProcessor': 'encoder_repetition_penalty',
+        'HyperbolicFractalLogitsWarper': 'hflw',
+        'HypernomicGradientLogitsWarper': 'hypernomic_gradient',
+        'SephiroticEmanationLogitsWarper': 'sephirotic_emanation',
+        'QliphoticInversionLogitsWarper': 'qliphotic_inversion',
+        'PanopticConsciousnessSampler': 'panoptic_consciousness',
         'NoRepeatNGramLogitsProcessor': 'no_repeat_ngram',
     }
     def custom_sort_key(obj):
@@ -802,7 +1398,7 @@ def generation_config_init_patch(self, **kwargs):
         'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'dry', 'temperature',
         'dynamic_temperature', 'quadratic_sampling', 'top_k', 'top_p', 'typical_p',
         'epsilon_cutoff', 'eta_cutoff', 'tfs', 'top_a', 'min_p', 'mirostat', 'xtc',
-        'margin_adaptive', 'cot_refinement', 'mcts', 'encoder_repetition_penalty', 'no_repeat_ngram'
+        'margin_adaptive', 'cot_refinement', 'mcts', 'enhanced_oscillatory_reflection', 'inference_time_extension', 'encoder_repetition_penalty', 'no_repeat_ngram', 'hflw', 'hypernomic_gradient', 'sephirotic_emanation', 'qliphotic_inversion'
     ])
     # --- 新增 margin adaptive 相關參數 ---
     self.margin_adaptive = kwargs.pop("margin_adaptive", False)
@@ -819,7 +1415,57 @@ def generation_config_init_patch(self, **kwargs):
     self.mcts_rollout_depth = kwargs.pop("mcts_rollout_depth", 2)
     self.mcts_rollout_samples = kwargs.pop("mcts_rollout_samples", 1)
     self.mcts_exploration_const = kwargs.pop("mcts_exploration_const", 1.0)
+    self.mcts_context_window = kwargs.pop("mcts_context_window", 10)
+    self.mcts_penalty_factor = kwargs.pop("mcts_penalty_factor", 0.1)
+    # --- 新增：Enhanced Oscillatory Reflection 採樣器相關參數 ---
+    self.enhanced_oscillatory_reflection = kwargs.pop("enhanced_oscillatory_reflection", False)
+    self.enhanced_oscillatory_base_amplitude = kwargs.pop("enhanced_oscillatory_base_amplitude", 0.5)
+    self.enhanced_oscillatory_base_frequency = kwargs.pop("enhanced_oscillatory_base_frequency", 0.1)
+    self.enhanced_oscillatory_dropout_prob = kwargs.pop("enhanced_oscillatory_dropout_prob", 0.1)
+    # --- 新增：Inference Time Extension 相關參數 ---
+    self.inference_time_extension = kwargs.pop("inference_time_extension", False)
+    self.inference_max_delay = kwargs.pop("inference_max_delay", 0.5)
+    self.inference_entropy_threshold = kwargs.pop("inference_entropy_threshold", 1.5)
+    self.inference_confidence_threshold = kwargs.pop("inference_confidence_threshold", 0.85)
 
+    # --- 新增：Hyperbolic Fractal 相關參數 ---
+    self.hflw_enabled = kwargs.pop("hflw_enabled", False)
+    self.hflw_alpha = kwargs.pop("hflw_alpha", 1.0)
+    self.hflw_beta = kwargs.pop("hflw_beta", 0.5)
+    self.hflw_p_init = kwargs.pop("hflw_p_init", 2.0)
+    self.hflw_lambda_factor = kwargs.pop("hflw_lambda_factor", 0.1)
+    # --- 新增：Hypernomic Gradient 相關參數 ---
+    self.hypernomic_gradient = kwargs.pop("hypernomic_gradient", False)
+    self.hgd_alpha = kwargs.pop("hgd_alpha", 1.2)
+    self.hgd_beta = kwargs.pop("hgd_beta", 0.8)
+    self.asm_tau = kwargs.pop("asm_tau", 0.05)
+    self.asm_lambda = kwargs.pop("asm_lambda", 0.7)
+    self.asm_mu = kwargs.pop("asm_mu", 0.3)
+    # --- New parameters for our samplers ---
+    self.sephirotic_emanation = kwargs.pop("sephirotic_emanation", False)
+    self.seph_penalties = kwargs.pop("seph_penalties", [0.0] * 10)
+    self.seph_scaling = kwargs.pop("seph_scaling", 1.0)
+    self.seph_phase = kwargs.pop("seph_phase", 0.0)
+    self.scriptural_weights = kwargs.pop("scriptural_weights", {i: 0.0 for i in range(10)})
+
+    self.qliphotic_inversion = kwargs.pop("qliphotic_inversion", False)
+    self.qliph_penalties = kwargs.pop("qliph_penalties", [0.0] * 10)
+    self.qliph_scaling = kwargs.pop("qliph_scaling", 1.0)
+    self.qliph_phase = kwargs.pop("qliph_phase", 0.0)
+    self.scriptural_bonus = kwargs.pop("scriptural_bonus", {i: 0.0 for i in range(10)})
+
+    # New parameters for PanopticConsciousnessSampler:
+    self.panoptic_consciousness = kwargs.pop("panoptic_consciousness", False)
+    self.panoptic_target_entropy = kwargs.pop("panoptic_target_entropy", 0.7)
+    self.panoptic_sensitivity = kwargs.pop("panoptic_sensitivity", 1.0)
+    self.panoptic_reflection_rate = kwargs.pop("panoptic_reflection_rate", 0.1)
+    self.panoptic_awakening_threshold = kwargs.pop("panoptic_awakening_threshold", 5.0)
+    self.panoptic_awakening_multiplier = kwargs.pop("panoptic_awakening_multiplier", 3.0)
+    self.panoptic_reflection_iterations = kwargs.pop("panoptic_reflection_iterations", 3)
+    self.panoptic_temporal_memory_factor = kwargs.pop("panoptic_temporal_memory_factor", 1.0)
+    self.panoptic_ethical_modulation = kwargs.pop("panoptic_ethical_modulation", 1.0)
+    self.panoptic_target_ethics = kwargs.pop("panoptic_target_ethics", 0.8)
+    self.panoptic_workspace_decay = kwargs.pop("panoptic_workspace_decay", 0.9)
 
 def hijack_samplers():
     transformers.GenerationMixin._get_logits_processor_old = transformers.GenerationMixin._get_logits_processor

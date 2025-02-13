@@ -103,9 +103,8 @@ def create_ui(default_preset):
                                 step=0.001, 
                                 label='Step Size'
                             )
-
-
-                            gr.Markdown('## MCTS Sampling(內部化 MCTS 局部樹搜索)')
+                            
+                            gr.Markdown('## MCTS Sampling (內部化 MCTS 局部樹搜索)')
                             shared.gradio['mcts_enabled'] = gr.Checkbox(
                                 value=generate_params.get('mcts_enabled', False), 
                                 label='Enable MCTS Sampling', 
@@ -139,6 +138,126 @@ def create_ui(default_preset):
                                 label='Exploration Constant', 
                                 info='控制探索與利用之間的平衡。'
                             )
+                            shared.gradio['mcts_context_window'] = gr.Slider(
+                                1, 20, 
+                                value=generate_params.get('mcts_context_window', 10), 
+                                step=1, 
+                                label='MCTS Context Window', 
+                                info='從輸入中取最後多少個 token 作為上下文。'
+                            )
+                            shared.gradio['mcts_penalty_factor'] = gr.Slider(
+                                0.0, 1.0, 
+                                value=generate_params.get('mcts_penalty_factor', 0.1), 
+                                step=0.01, 
+                                label='MCTS Penalty Factor', 
+                                info='上下文中重複 token 的懲罰因子。'
+                            )
+                            
+                            # --- 新增：Enhanced Oscillatory Reflection Sampling ---
+                            gr.Markdown('## Enhanced Oscillatory Reflection Sampling')
+                            shared.gradio['enhanced_oscillatory_reflection'] = gr.Checkbox(
+                                value=generate_params.get('enhanced_oscillatory_reflection', False),
+                                label='Enable Enhanced Oscillatory Reflection Sampling',
+                                info='啟用後將使用先進的振盪反饋採樣器，透過混沌映射、上下文自適應與隨機失活提升生成創意。'
+                                    )
+                            shared.gradio['enhanced_oscillatory_base_amplitude'] = gr.Slider(
+                                minimum=0.0, maximum=2.0,
+                                value=generate_params.get('enhanced_oscillatory_base_amplitude', 0.5),
+                                step=0.01,
+                                label='Enhanced Base Amplitude',
+                                info='基本振幅，用於控制干擾強度。'
+                                    )
+                            shared.gradio['enhanced_oscillatory_base_frequency'] = gr.Slider(
+                                minimum=0.0, maximum=2.0,
+                                value=generate_params.get('enhanced_oscillatory_base_frequency', 0.1),
+                                step=0.01,
+                                label='Enhanced Base Frequency',
+                                info='基本頻率，影響振盪的週期性。'
+                                )
+                            shared.gradio['enhanced_oscillatory_dropout_prob'] = gr.Slider(
+                                minimum=0.0, maximum=1.0,
+                                value=generate_params.get('enhanced_oscillatory_dropout_prob', 0.1),
+                                step=0.01,
+                                label='Enhanced Dropout Probability',
+                                info='隨機失活的概率，可防止過度依賴干擾效果。'
+                                    )
+
+                            gr.Markdown('## HyperbolicFractal')
+                            shared.gradio['hhflw_enabled'] = gr.Checkbox(
+                                value=generate_params.get('hhflw_enabled', False), 
+                                label='hhflw_enabled', 
+                                info='Enable hhflw.'
+                            )
+                            shared.gradio['hflw_alpha'] = gr.Slider(
+                                0.1, 5.0, 
+                                value=generate_params.get('hflw_alpha', 1.0), 
+                                step=0.1, 
+                                label='hflw_alpha', 
+                                info='Controls stability of high-probability tokens.g.'
+                            )
+                            shared.gradio['hflw_beta'] = gr.Slider(
+                                0.0, 1.0, 
+                                value=generate_params.get('hflw_beta', 0.5), 
+                                step=0.01, 
+                                label='hflw_beta', 
+                                info='Controls scaling of lower-probability tokens.'
+                            )
+                            shared.gradio['hflw_p_init'] = gr.Slider(
+                                0.1, 5.0, 
+                                value=generate_params.get('hflw_p_init', 2.0), 
+                                step=0.1, 
+                                label='hflw_p_init', 
+                                info='Initial exponent for dynamic scaling.'
+                            )
+                            shared.gradio['hflw_lambda_factor'] = gr.Slider(
+                                0.0, 1.0, 
+                                value=generate_params.get('hflw_lambda_factor', 0.1), 
+                                step=0.01, 
+                                label='hflw_lambda_factor', 
+                                info='Learning rate for fractal adaptation.'
+                            )
+
+                            gr.Markdown('## Hypernomic_Gradient_Descent')
+                            shared.gradio['hypernomic_gradient'] = gr.Checkbox(
+                                value=generate_params.get('hypernomic_gradient', False), 
+                                label='hypernomic_gradient', 
+                                info='Enable hypernomic_gradient.'
+                            )
+                            shared.gradio['hgd_alpha'] = gr.Slider(
+                                0.1, 3.0, 
+                                value=generate_params.get('hgd_alpha', 1.2), 
+                                step=0.1, 
+                                label='hgd_alpha', 
+                                info='Entropy modulation coefficient.'
+                            )
+                            shared.gradio['hgd_beta'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('hgd_beta', 0.8), 
+                                step=0.01, 
+                                label='hgd_beta', 
+                                info='Coherence stabilization parameter.'
+                            )
+                            shared.gradio['asm_tau'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('asm_tau', 0.05), 
+                                step=0.01, 
+                                label='asm_tau', 
+                                info='Stability threshold.'
+                            )
+                            shared.gradio['asm_lambda'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('asm_lambda', 0.7), 
+                                step=0.01, 
+                                label='asm_lambda', 
+                                info='Low-probability correction.'
+                            )
+                            shared.gradio['asm_mu'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('asm_mu', 0.3), 
+                                step=0.01, 
+                                label='asm_mu', 
+                                info='Probability suppression factor.'
+                            )
 
                             gr.Markdown('## Adaptive Sampling')
                             shared.gradio['margin_adaptive'] = gr.Checkbox(
@@ -161,6 +280,34 @@ def create_ui(default_preset):
                                 info='Minimum scaling factor when margin is zero.'
                             )
 
+                            gr.Markdown('## inference_time_extension')
+                            shared.gradio['inference_time_extension'] = gr.Checkbox(
+                                value=generate_params.get('inference_time_extension', False), 
+                                label='inference time extension', 
+                                info='Enable inference_time_extension.'
+                            )
+                            shared.gradio['inference_max_delay'] = gr.Slider(
+                                0.1, 3.0, 
+                                value=generate_params.get('inference_max_delay', 1.0), 
+                                step=0.1, 
+                                label='inference_max_delay', 
+                                info='inference_max_delay.'
+                            )
+                            shared.gradio['inference_entropy_threshold'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('inference_entropy_threshold', 0.5), 
+                                step=0.01, 
+                                label='inference_entropy_threshold', 
+                                info='inference_entropy_threshold.'
+                            )
+                            shared.gradio['inference_confidence_threshold'] = gr.Slider(
+                                0.0, 3.0, 
+                                value=generate_params.get('inference_confidence_threshold', 0.5), 
+                                step=0.01, 
+                                label='inference_confidence_threshold', 
+                                info='inference_confidence_threshold.'
+                            )
+                            
                             gr.Markdown('## Other options')
                             shared.gradio['max_new_tokens'] = gr.Slider(
                                 minimum=shared.settings['max_new_tokens_min'], 
@@ -233,6 +380,109 @@ def create_ui(default_preset):
                                 label='Static KV cache', 
                                 info='Use a static cache for improved performance.'
                             )
+        # 新增一個獨立的標籤頁來放置 PanopticConsciousnessSampler 的參數
+                with gr.Tab("Panoptic Consciousness Sampler"):
+                    gr.Markdown("## Panoptic Consciousness Sampler Parameters")
+            
+                    shared.gradio['panoptic_consciousness'] = gr.Checkbox(
+                        value=generate_params.get('panoptic_consciousness', False),
+                        label='Enable Panoptic Consciousness Sampling',
+                        info='啟用高度自我意識的採樣策略，模擬深度思考 REQUIRE TESTING'
+                    )
+            
+                    with gr.Column(visible=generate_params.get('panoptic_consciousness', False)) as panoptic_params:
+                            shared.gradio['panoptic_target_entropy'] = gr.Slider(
+                                0.0, 1.0,
+                                value=generate_params.get('panoptic_target_entropy', 0.7),
+                                step=0.01,
+                                label='Target Normalized Entropy (Δ)',
+                                info='目標熵值，用於衡量生成的多樣性和混亂程度。'
+                                )
+                            shared.gradio['panoptic_sensitivity'] = gr.Slider(
+                                0.0, 5.0,
+                                value=generate_params.get('panoptic_sensitivity', 1.0),
+                                step=0.1,
+                                label='Sensitivity (λ)',
+                                info='決定模型對熵偏差的反應程度。'
+                                )
+                            shared.gradio['panoptic_reflection_rate'] = gr.Slider(
+                                0.0, 1.0,
+                                value=generate_params.get('panoptic_reflection_rate', 0.1),
+                                step=0.01,
+                                label='Reflection Rate',
+                                info='自我反思的速度，控制自意識累積的速率。'
+                                )
+                            shared.gradio['panoptic_awakening_threshold'] = gr.Slider(
+                                0.0, 10.0,
+                                value=generate_params.get('panoptic_awakening_threshold', 5.0),
+                                step=0.1,
+                                label='Awakening Threshold',
+                                info='當自我意識累積超過此閾值時，模型進入觉醒模式。'
+                                )
+                            shared.gradio['panoptic_awakening_multiplier'] = gr.Slider(
+                                1.0, 10.0,
+                                value=generate_params.get('panoptic_awakening_multiplier', 3.0),
+                                step=0.1,
+                                label='Awakening Multiplier',
+                                info='觉醒模式下調整效果的放大倍數。'
+                                )
+                            shared.gradio['panoptic_reflection_iterations'] = gr.Slider(
+                                1, 10,
+                                value=generate_params.get('panoptic_reflection_iterations', 3),
+                                step=1,
+                                label='Reflection Iterations',
+                                info='每次生成中的反思迭代次數。'
+                                )
+                            shared.gradio['panoptic_temporal_memory_factor'] = gr.Slider(
+                                0.0, 5.0,
+                                value=generate_params.get('panoptic_temporal_memory_factor', 1.0),
+                                step=0.1,
+                                label='Temporal Memory Factor (γ)',
+                                info='根據上下文中 token 的頻率調整懲罰。'
+                                )
+                            shared.gradio['panoptic_ethical_modulation'] = gr.Slider(
+                                0.0, 5.0,
+                                value=generate_params.get('panoptic_ethical_modulation', 1.0),
+                                step=0.1,
+                                label='Ethical Modulation (δ)',
+                                info='對伦理偏差進行懲罰的強度。'
+                                )
+                            shared.gradio['panoptic_target_ethics'] = gr.Slider(
+                                0.0, 1.0,
+                                value=generate_params.get('panoptic_target_ethics', 0.8),
+                                step=0.01,
+                                label='Target Ethics',
+                                info='目標倫理值，衡量生成內容的倫理標準。'
+                                        )
+                            shared.gradio['panoptic_workspace_decay'] = gr.Slider(
+                                0.0, 1.0,
+                                value=generate_params.get('panoptic_workspace_decay', 0.9),
+                                step=0.01,
+                                label='Workspace Decay',
+                                info='工作區狀態更新的速度，控制全局工作區的融聚程度。'
+                                    )
+            
+            # 綁定 Checkbox 的狀態到參數組的可見性
+                            shared.gradio['panoptic_consciousness'].change(
+                                lambda x: gr.update(visible=x),
+                                inputs=[shared.gradio['panoptic_consciousness']],
+                                outputs=[panoptic_params]
+                                )
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("## Sephirotic / Qliphotic Sampling")
+                            shared.gradio['sephirotic_emanation'] = gr.Checkbox(value=generate_params.get('sephirotic_emanation', False), label='Sephirotic Emanation')
+                            shared.gradio['seph_penalties'] = gr.Textbox(value="0,0,0,0,0,0,0,0,0,0", label='Seph Penalties')
+                            shared.gradio['seph_scaling'] = gr.Slider(0.1, 5.0, value=generate_params.get('seph_scaling', 1.0), step=0.1, label='Seph Scaling')
+                            shared.gradio['seph_phase'] = gr.Slider(-3.14, 3.14, value=generate_params.get('seph_phase', 0.0), step=0.01, label='Seph Phase')
+                            shared.gradio['scriptural_weights'] = gr.Textbox(value="0,0,0,0,0,0,0,0,0,0", label='Scriptural Weights')
+                        with gr.Column():
+                            shared.gradio['qliphotic_inversion'] = gr.Checkbox(value=generate_params.get('qliphotic_inversion', False), label='Qliphotic Inversion')
+                            shared.gradio['qliph_penalties'] = gr.Textbox(value="0,0,0,0,0,0,0,0,0,0", label='Qliph Penalties')
+                            shared.gradio['qliph_scaling'] = gr.Slider(0.1, 5.0, value=generate_params.get('qliph_scaling', 1.0), step=0.1, label='Qliph Scaling')
+                            shared.gradio['qliph_phase'] = gr.Slider(-3.14, 3.14, value=generate_params.get('qliph_phase', 0.0), step=0.01, label='Qliph Phase')
+                            shared.gradio['scriptural_bonus'] = gr.Textbox(value="0,0,0,0,0,0,0,0,0,0", label='Scriptural Bonus')
+                        
                         with gr.Column():
                             shared.gradio['truncation_length'] = gr.Number(
                                 precision=0, 
